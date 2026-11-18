@@ -15,7 +15,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Authentification (Google Identity Services, flux implicite : jeton de 1 h, pas de refresh token) ----
 export function makeAuth(clientId, { onConnected } = {}) {
+  // Le jeton (valable ~1 h) est conservé sur l'appareil : fermer / rouvrir l'application ne coupe pas la synchro automatique.
+  const KEY = 'drive_token';
   let token = null, expires = 0;
+  try { const t = JSON.parse(localStorage.getItem(KEY) || 'null'); if (t && t.cid === clientId && Date.now() < t.expires - 60000) ({ token, expires } = t); } catch { /* rien */ }
   const loadGis = () => new Promise((resolve, reject) => {
     if (globalThis.google?.accounts?.oauth2) return resolve();
     const s = document.createElement('script');
@@ -26,7 +29,10 @@ export function makeAuth(clientId, { onConnected } = {}) {
   });
   return {
     get connected() { return !!token && Date.now() < expires - 60000; },
-    invalidate() { token = null; expires = 0; },
+    get expiresAt() { return token ? expires : 0; },
+    /** Déjà autorisé une fois sur cet appareil : la reconnexion se fait sans nouvel écran de consentement. */
+    get known() { return localStorage.getItem('drive_connected') === '1'; },
+    invalidate() { token = null; expires = 0; try { localStorage.removeItem(KEY); } catch { /* rien */ } },
     async getToken() {
       if (token && Date.now() < expires - 60000) return token;
       if (!clientId) throw authError('Identifiant client Google non renseigné');
@@ -38,7 +44,9 @@ export function makeAuth(clientId, { onConnected } = {}) {
           callback: (r) => {
             if (r.error) return reject(authError(r.error_description || r.error));
             token = r.access_token; expires = Date.now() + (Number(r.expires_in) || 3600) * 1000;
-            localStorage.setItem('drive_connected', '1'); onConnected?.();
+            localStorage.setItem('drive_connected', '1');
+            try { localStorage.setItem(KEY, JSON.stringify({ token, expires, cid: clientId })); } catch { /* rien */ }
+            onConnected?.();
             resolve(token);
           },
           error_callback: (e) => reject(authError(e?.type === 'popup_closed' ? 'Connexion annulée' : (e?.message || e?.type || 'Échec de connexion'))),

@@ -181,3 +181,4 @@ input.ck-note { margin-top: 8px; min-height: 38px; font-size: .88rem; }
 .btn[disabled] { opacity: .35; cursor: default; }
 @media (max-width: 600px) { .grid2.stack { grid-template-columns: minmax(0, 1fr); } }
 .grid2 > .field, .grid3 > .field { min-width: 0; }
+.pill.tap { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }

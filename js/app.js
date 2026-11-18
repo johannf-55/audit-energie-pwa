@@ -14,6 +14,7 @@ const main = $('#main');
 const store = new IdbStore();
 const S = { audit: null, utilities: [], links: [], notes: [], photos: [] };
 const F = { q: '', fam: '', cat: '' };
+let failed = false, syncAgain = false;
 let deviceId, auth = null, remote = null, authFor = '', syncing = false, autoTimer = null, syncMsg = '', syncPending = null, zoom = null, installEvt = null;
 
 const FAM_ORDER = Object.keys(FAMILIES);
@@ -78,12 +79,20 @@ const confirmDlg = (msg, okLabel = 'Supprimer') => new Promise((resolve) => {
   d.addEventListener('close', () => resolve(false), { once: true });
 });
 
+// Nombre d'éléments en attente d'envoi : audits modifiés + base des checklists modifiée
+async function pendingCount() {
+  return Object.keys(await store.metaGet('dirty', {})).length + ((await store.metaGet('checkBaseDirty', 0)) ? 1 : 0);
+}
 function updatePill() {
-  store.metaGet('dirty', {}).then(async (dirty) => {
-    const pill = $('#pill'), n = Object.keys(dirty).length, last = await store.metaGet('lastSync', 0);
-    const online = navigator.onLine;
-    pill.className = 'pill ' + (!online ? 'off' : n ? 'warn' : last ? 'ok' : '');
-    pill.textContent = syncing ? (syncMsg || 'Synchro…') : !online ? (n ? `Hors ligne · ${n} en attente` : 'Hors ligne') : n ? `${n} audit(s) à synchroniser` : last ? `✓ Synchronisé ${new Date(last).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}` : 'Jamais synchronisé';
+  pendingCount().then(async (n) => {
+    const pill = $('#pill'), last = await store.metaGet('lastSync', 0);
+    const online = navigator.onLine, paused = autoOn() && clientId() && last && !auth?.connected;
+    const hm = (t) => new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    pill.className = 'pill ' + (!online ? 'off' : paused ? 'warn tap' : n ? 'warn' : last ? 'ok' : '');
+    pill.textContent = syncing ? (syncMsg || 'Synchro…') : !online ? (n ? `Hors ligne · ${n} en attente` : 'Hors ligne')
+      : paused ? `Synchro auto en pause${n ? ` · ${n} en attente` : ''} — touchez pour reprendre`
+      : n ? `${n} modification(s) à envoyer` : last ? `✓ Synchronisé ${hm(last)}${autoOn() && auth?.connected ? ' · auto' : ''}` : 'Jamais synchronisé';
+    pill.title = paused ? 'L’autorisation Google (1 h) a expiré : un toucher suffit pour la renouveler, sans ressaisie.' : '';
     $('#btnSync').classList.toggle('spin', syncing);
   });
 }
@@ -672,23 +681,46 @@ function getRemote() {
   return remote;
 }
 async function doSync({ silent = false } = {}) {
-  if (syncing) return;
+  if (syncing) { syncAgain = true; return; }
+  clearTimeout(autoTimer); failed = false;
   if (!clientId()) { if (!silent) { toast('Renseignez d’abord l’identifiant client Google (⚙ Réglages).'); openSettings(); } return; }
   if (!navigator.onLine) { if (!silent) toast('Hors ligne : vos données restent sur l’appareil et seront synchronisées plus tard.'); return; }
   syncing = true; updatePill();
   try {
     const st = await syncAll(store, getRemote(), { onProgress: (m) => { syncMsg = m; updatePill(); } });
     const parts = [st.pulled && `${st.pulled} audit(s) reçu(s)`, st.pushed && `${st.pushed} envoyé(s)`, st.photosUp && `${st.photosUp} photo(s) envoyée(s)`, st.photosDown && `${st.photosDown} photo(s) reçue(s)`].filter(Boolean);
-    toast(st.errors.length ? `Synchro partielle : ${st.errors[0]}` : parts.length ? 'Synchronisé — ' + parts.join(', ') : 'Tout est à jour');
-  } catch (e) { toast(e.code === 'AUTH' ? `Connexion Google nécessaire : ${e.message}` : `Échec de la synchro : ${e.message}`, 5000); }
-  finally { syncing = false; syncMsg = ''; await reloadBase(); updatePill(); if (!$('#dlg').open) await refreshViewSafe(); }
+    failed = st.errors.length > 0;
+    // Synchro automatique : silencieuse, sauf erreur ou données reçues d'un autre appareil
+    const received = [st.pulled && `${st.pulled} audit(s)`, st.photosDown && `${st.photosDown} photo(s)`, st.basePulled && 'la base des checklists'].filter(Boolean);
+    if (st.errors.length) toast(`Synchro partielle : ${st.errors[0]}`, 5000);
+    else if (!silent) toast(parts.length ? 'Synchronisé — ' + parts.join(', ') : 'Tout est à jour');
+    else if (received.length) toast('Mis à jour depuis un autre appareil : ' + received.join(', '));
+  } catch (e) {
+    failed = true;
+    if (e.code === 'AUTH') { auth?.invalidate(); if (!silent) toast(`Connexion Google nécessaire : ${e.message}`, 5000); }
+    else if (!silent) toast(`Échec de la synchro : ${e.message}`, 5000);
+  }
+  finally {
+    syncing = false; syncMsg = ''; await reloadBase(); updatePill(); if (!$('#dlg').open) await refreshViewSafe();
+    // Des modifications faites pendant la synchro partent aussitôt après
+    if (syncAgain || (!failed && (await pendingCount()))) { syncAgain = false; if (!failed) scheduleAutoSync(500); }
+  }
 }
 // Évite de détruire une saisie en cours : on ne recharge la vue que si aucun champ n'a le focus
 const refreshViewSafe = async () => { const a = document.activeElement; if (a && /INPUT|TEXTAREA|SELECT/.test(a.tagName)) return; await route({ keep: true }); };
-function scheduleAutoSync() {
+// ---- Synchronisation automatique
+// Envoi quelques secondes après chaque modification (regroupe une saisie rapide), au retour du réseau, au retour dans
+// l'application et toutes les 3 minutes (réception des modifications faites sur un autre appareil).
+// Limite Google : l'autorisation dure 1 h et ne peut être renouvelée sans un geste de l'utilisateur (fenêtre Google).
+// Quand elle expire, la saisie continue en local et le bandeau propose de reprendre d'un toucher.
+const AUTO_DELAY = 3000, AUTO_PULL = 180000;
+const autoOn = () => localStorage.getItem('cfg_auto') !== '0';
+function scheduleAutoSync(delay = AUTO_DELAY) {
   clearTimeout(autoTimer);
-  if (!auth?.connected || !navigator.onLine) return; // jeton Google valide 1 h : pas de fenêtre de connexion sans geste de l'utilisateur
-  autoTimer = setTimeout(() => doSync({ silent: true }), 20000);
+  if (!autoOn() || !clientId() || !navigator.onLine) return;
+  getRemote();
+  if (!auth.connected) { updatePill(); return; } // pas de fenêtre Google sans geste de l'utilisateur
+  autoTimer = setTimeout(() => doSync({ silent: true }), delay);
 }
 
 const theme = () => (localStorage.getItem('cfg_theme') === 'light' ? 'light' : 'dark');
@@ -706,6 +738,9 @@ async function openSettings() {
       <label class="field"><span>Identifiant client OAuth Google</span><input type="text" id="cid" placeholder="xxxxxxxx.apps.googleusercontent.com" value="${esc(clientId())}"></label>
       <p class="small muted">Créé une fois dans Google Cloud Console (voir le guide de déploiement). Les données sont écrites dans votre Drive, dossier <code>AuditEnergie</code>${root ? ` — <a href="https://drive.google.com/drive/folders/${root}" target="_blank" rel="noopener">ouvrir</a>` : ''}.</p>
       <button class="btn primary block" id="sg">Enregistrer et synchroniser</button></div>
+    <div class="card"><h2>Synchronisation automatique</h2>
+      <div class="row"><button class="chip ${autoOn() ? 'on' : ''}" data-auto="1">Automatique</button><button class="chip ${autoOn() ? '' : 'on'}" data-auto="0">Manuelle (⟳)</button></div>
+      <p class="small muted">En automatique, chaque modification est envoyée quelques secondes après, et les modifications des autres appareils sont reçues toutes les 3 minutes et au retour dans l’application. L’autorisation Google dure 1 heure : à son expiration, la saisie continue normalement et le bandeau propose de reprendre d’un toucher.${auth?.connected ? ` Autorisation valable jusqu’à ${new Date(auth.expiresAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}.` : ''}</p></div>
     <div class="card"><h2>Affichage</h2>
       <div class="row"><button class="chip ${theme() === 'dark' ? 'on' : ''}" data-theme="dark">🌙 Sombre</button><button class="chip ${theme() === 'light' ? 'on' : ''}" data-theme="light">☀ Clair</button></div></div>
     <div class="card"><h2>Base de checklists</h2><p class="small muted">Points de contrôle proposés pour chaque type d’utilité : ajout, modification, import / export Excel.</p><button class="btn block" id="baseBtn">☑ Modifier la base de checklists</button></div>
@@ -715,7 +750,8 @@ async function openSettings() {
       ${persisted ? '' : '<button class="btn small" id="persist" style="margin-top:8px">Demander le stockage persistant</button>'}
       ${installEvt ? '<button class="btn small" id="install" style="margin-top:8px">Installer l’application</button>' : ''}</div>
     <div class="row"><button class="btn" id="demoBtn">Charger l’audit de démonstration</button><span class="grow"></span><button class="btn primary" data-close>Fermer</button></div>
-    <p class="small muted">Appareil <code>${deviceId.slice(0, 8)}</code> · version prototype 0.3</p>`, (d) => {
+    <p class="small muted">Appareil <code>${deviceId.slice(0, 8)}</code> · version prototype 0.4</p>`, (d) => {
+    d.querySelectorAll('[data-auto]').forEach((b) => { b.onclick = () => { localStorage.setItem('cfg_auto', b.dataset.auto); d.querySelectorAll('[data-auto]').forEach((x) => x.classList.toggle('on', x === b)); updatePill(); scheduleAutoSync(); }; });
     d.querySelectorAll('[data-theme]').forEach((b) => { b.onclick = () => { setTheme(b.dataset.theme); d.querySelectorAll('[data-theme]').forEach((x) => x.classList.toggle('on', x === b)); }; });
     $('#baseBtn', d).onclick = () => { d.close(); actions.openBase(); };
     $('#sg', d).onclick = () => { localStorage.setItem('cfg_client_id', $('#cid', d).value.trim()); d.close(); doSync(); };
@@ -753,7 +789,10 @@ main.addEventListener('input', debounce((e) => { if (e.target.closest('#detail')
 $('#btnSync').onclick = () => doSync();
 $('#btnSettings').onclick = openSettings;
 addEventListener('hashchange', () => route());
-addEventListener('online', () => { updatePill(); toast('Réseau rétabli — touchez ⟳ pour synchroniser'); });
+addEventListener('online', () => { updatePill(); if (autoOn() && auth?.connected) { toast('Réseau rétabli — synchronisation…'); scheduleAutoSync(1000); } else toast('Réseau rétabli — touchez ⟳ pour synchroniser'); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { updatePill(); scheduleAutoSync(1000); } });
+setInterval(() => { if (document.visibilityState === 'visible' && !syncing) scheduleAutoSync(0); }, AUTO_PULL);
+$('#pill').onclick = () => { if ($('#pill').classList.contains('tap')) doSync(); };
 addEventListener('offline', () => { updatePill(); toast('Hors ligne — la saisie continue normalement'); });
 addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installEvt = e; });
 addEventListener('pagehide', () => { /* IndexedDB est déjà écrit à chaque modification */ });
@@ -765,7 +804,9 @@ addEventListener('pagehide', () => { /* IndexedDB est déjà écrit à chaque mo
   navigator.storage?.persist?.().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
   await reloadBase();
-  updatePill(); setInterval(updatePill, 60000);
+  if (clientId()) getRemote(); // reprend l'autorisation Google encore valide (application rouverte dans l'heure)
+  updatePill(); setInterval(updatePill, 30000);
   await route();
+  scheduleAutoSync(1500);
   window.__app = { store, doSync, S, base: () => CB }; // utile pour les tests automatisés
 })();

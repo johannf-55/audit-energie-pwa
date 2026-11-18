@@ -1,5 +1,5 @@
 // Service worker : coquille de l'app en cache (hors ligne), réseau direct pour Google.
-const VERSION = 'v5';
+const VERSION = 'v6';
 const CACHE = `audit-energie-${VERSION}`;
 const SHELL = ['./', 'index.html', 'style.css', 'config.js', 'manifest.webmanifest',
   'js/app.js', 'js/demo.js', 'js/model.js', 'js/db.js', 'js/sync-core.js', 'js/drive.js', 'js/synoptic.js', 'js/export.js', 'js/xlsx.js', 'js/checklist.js', 'js/checklist-base.js', 'js/zip.js',
